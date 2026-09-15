@@ -153,6 +153,59 @@ validation.
 - `sceGameUpdateGetAddcontLatestVersion` returns success with `found=false` for
   every valid label.
 
+## Building
+
+### Windows
+
+`DlcEmu.sln`, configuration `ReleaseHooks|Prospero`, with the Prospero SDK.
+This is the reference build and is unaffected by everything below.
+
+### Linux
+
+`Makefile` and `build.sh` build the same three modules with
+[ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk) and upstream LLD, no
+Prospero SDK and no Windows:
+
+```sh
+./build.sh                      # nolog and log, into out/payload-sdk/
+PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk ./build.sh
+make verify MODULES=libSceGameUpdate
+```
+
+Every build runs `tools/verify_payload_prx.py`, which reads the finished module
+back and checks it against the `.pemd` it came from. A wrong NID or library id
+links cleanly and only misbehaves on the console, so the check is not optional.
+
+Two jobs the Prospero linker does from the `.pemd` have no equivalent upstream,
+and `tools/` does them instead:
+
+- `dlc_prx_meta.py` parses the `.pemd` and derives the NIDs, the symbol
+  suffixes and the module and library ids. It is the only place that
+  arithmetic lives, because the generator, the linker script and the stamper
+  must agree on it exactly.
+- `generate_payload_exports.py` renames every export to its NID before the
+  link and satisfies every import from a generated stub, so the imports carry
+  NID names too.
+- `prepare_prx_link_script.py` injects the SCE dynamic entries, which LLD
+  cannot emit, and `stamp_payload_prx.py` points them at `.dynstr` and sets
+  the SCE ELF identity afterwards.
+- `prx_hash_fix.py` moves the exports into the buckets the loader will look
+  in: LLD hashes the short symbol name, the loader hashes the expanded one.
+
+The exports match the Prospero-built modules NID for NID, as do the module
+name, the export libraries and their ids, and the imported modules. The
+imports differ in two ways, both harmless:
+
+- The Prospero libc reaches `tolower`, `isalnum`, `isxdigit` and `strtoul`
+  through macros over `_Getptolower`, `_Getpctype` and `_Stoul`; this build
+  calls the public functions. Different entry point, same work.
+- There is no `--gc-sections` here, so a module keeps the shared emulation
+  code its exports do not reach, and imports what that code needs.
+  `libSceGameUpdate` is the visible case.
+
+`DT_SCE_MODULE_FILENAME` is the plain module name rather than the absolute
+path of whoever built it.
+
 ## Logging
 
 Logging is disabled by default. Enable `SCE_DLC_EMU_LOG` in

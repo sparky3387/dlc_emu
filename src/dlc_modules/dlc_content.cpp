@@ -279,6 +279,9 @@ struct RpcClientState {
 
 RpcClientState g_appRpc{};
 RpcClientState g_npRpc{};
+// Second client, to the appcontent_svc payload. Deliberately separate: areas 0/1
+// and every other AppContent call must keep going to the real daemon.
+RpcClientState g_app2Rpc{};
 
 bool is_zeroed(const void* data, size_t size) {
     if (!data) return false;
@@ -372,6 +375,11 @@ bool ensure_rpc_unlocked(RpcClientState& rpc,
                          const char serviceName[16],
                          uint64_t requestBufferSize,
                          uint64_t clientStorageSize) {
+    // Exactly one attempt per process, forever. A failure is never retried:
+    // connect() blocks indefinitely when the service name IS registered but its
+    // owner is wedged, and a client cannot tell that apart from a healthy one.
+    // One attempt bounds the exposure to that hazard at one; retrying would
+    // reopen it on every subsequent call.
     if (rpc.attempted) {
         return rpc.ready;
     }
@@ -406,6 +414,7 @@ bool ensure_rpc_unlocked(RpcClientState& rpc,
         return false;
     }
 
+    dlc_logf("dlc.%s_rpc connect-ok", logTag);
     rpc.ready = true;
     return true;
 }
@@ -424,6 +433,21 @@ bool ensure_np_rpc_unlocked() {
         'A', 'c', 'c', 'e', 's', 's', '\0', '\0'
     };
     return ensure_rpc_unlocked(g_npRpc, "np", kServiceName, 0x1000u, 0x17000u);
+}
+
+// The appcontent_svc payload. One attempt per process, like the other two
+// clients: if the payload is not up by the time the title first asks, the area
+// stays refused for that run. That is the intended ordering -- start the payload
+// first. A name that was never registered fails promptly (0x80020003), so a
+// missing payload costs nothing; a registered-but-wedged one blocks forever and
+// no client can tell the difference, which is why the fix for that lives on the
+// service side rather than in a timeout here.
+bool ensure_app2_rpc_unlocked() {
+    static constexpr char kServiceName[16] = {
+        'S', 'c', 'e', 'A', 'p', 'p', 'C', 'o',
+        'n', 't', 'e', 'n', 't', '2', '\0', '\0'
+    };
+    return ensure_rpc_unlocked(g_app2Rpc, "app2", kServiceName, 0x200u, 0xf800u);
 }
 
 int32_t map_app_rpc_result(int32_t rc) {
@@ -482,6 +506,32 @@ int32_t app_rpc_invoke(uint32_t command,
     int32_t serviceResult = 0;
     const int32_t invokeRc =
         invoke(g_appRpc.client, command, input, inputCount, &serviceResult, output, outputCount);
+    return invokeRc == SCE_OK ? map_app_rpc_result(serviceResult) : map_app_rpc_result(invokeRc);
+}
+
+// Same wire shape as app_rpc_invoke, different service. Unreachable is reported
+// as NOT_SUPPORTED so that the "firmware lacks area 2" refusal survives verbatim
+// as the fallback whenever the payload is not running.
+int32_t app2_rpc_invoke(uint32_t command,
+                        const IpcBuffer* input,
+                        uint32_t inputCount,
+                        IpcBuffer* output,
+                        uint32_t outputCount) {
+    DlcLockGuard lock(g_app2Rpc.mutex);
+    if (!ensure_app2_rpc_unlocked()) {
+        dlc_logf("dlc.app2_rpc cmd=0x%05x unreachable -> NOT_SUPPORTED",
+                 static_cast<unsigned>(command));
+        return SCE_APP_CONTENT_ERROR_NOT_SUPPORTED;
+    }
+    auto** vtable = *reinterpret_cast<void***>(g_app2Rpc.client);
+    auto invoke = reinterpret_cast<IpmiClientInvoke>(vtable[11]);
+    int32_t serviceResult = 0;
+    const int32_t invokeRc = invoke(
+        g_app2Rpc.client, command, input, inputCount, &serviceResult, output, outputCount);
+    dlc_logf("dlc.app2_rpc cmd=0x%05x invokeRc=0x%08x serviceResult=0x%08x",
+             static_cast<unsigned>(command),
+             static_cast<unsigned>(invokeRc),
+             static_cast<unsigned>(serviceResult));
     return invokeRc == SCE_OK ? map_app_rpc_result(serviceResult) : map_app_rpc_result(invokeRc);
 }
 
@@ -555,28 +605,183 @@ int32_t app_rpc_mount(uint32_t command,
     return app_rpc_invoke(command, input, 1, output, 1);
 }
 
-int32_t app_rpc_mount_operation(uint32_t command, const SceAppContentMountPoint* mountPoint) {
+// The marshalling below is identical for the real daemon and for appcontent_svc
+// -- only the transport differs -- so each helper takes the invoke to use and
+// defaults to the real one, leaving every existing call site unchanged.
+using RpcInvoke = int32_t (*)(uint32_t, const IpcBuffer*, uint32_t, IpcBuffer*, uint32_t);
+
+int32_t app_rpc_mount_operation(uint32_t command,
+                                const SceAppContentMountPoint* mountPoint,
+                                RpcInvoke invoke = &app_rpc_invoke) {
     IpcBuffer input[1] = {{const_cast<SceAppContentMountPoint*>(mountPoint), sizeof(*mountPoint)}};
-    return app_rpc_invoke(command, input, 1, nullptr, 0);
+    return invoke(command, input, 1, nullptr, 0);
 }
 
 int32_t app_rpc_mount_query(uint32_t command,
                             uint32_t selector,
                             const SceAppContentMountPoint* mountPoint,
-                            size_t* value) {
+                            size_t* value,
+                            RpcInvoke invoke = &app_rpc_invoke) {
     AppContentRpcControl control{selector, 0};
     IpcBuffer inputs[2] = {
         {&control, sizeof(control.value)},
         {const_cast<SceAppContentMountPoint*>(mountPoint), sizeof(*mountPoint)}
     };
     IpcBuffer outputs[1] = {{value, sizeof(*value)}};
-    return app_rpc_invoke(command, inputs, 2, outputs, 1);
+    return invoke(command, inputs, 2, outputs, 1);
 }
 
-int32_t app_rpc_mount_handle_command(uint32_t command, const void* downloadHandle) {
+int32_t app_rpc_mount_handle_command(uint32_t command,
+                                     const void* downloadHandle,
+                                     RpcInvoke invoke = &app_rpc_invoke) {
     uint64_t handle = reinterpret_cast<uint64_t>(downloadHandle);
     IpcBuffer input[1] = {{&handle, sizeof(handle)}};
-    return app_rpc_invoke(command, input, 1, nullptr, 0);
+    return invoke(command, input, 1, nullptr, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Download-data area 2, served by the appcontent_svc payload on firmware that
+// never provisioned one.
+// ---------------------------------------------------------------------------
+
+constexpr size_t kMountPointTextSize = sizeof(SceAppContentMountPoint::data) + 1u;
+
+// SceAppContentMountPoint::data need not be NUL-terminated.
+void mount_point_text(const SceAppContentMountPoint* mountPoint, char out[kMountPointTextSize]) {
+    if (!mountPoint) {
+        out[0] = '\0';
+        return;
+    }
+    std::memcpy(out, mountPoint->data, sizeof(mountPoint->data));
+    out[sizeof(mountPoint->data)] = '\0';
+}
+
+// "/download0" -> 0, "/download2" -> 2, anything else -> -1. The queries that
+// serve area 2 are fw 1.00 NIDs shared with /download0 -- which the title
+// actively uses -- so ownership has to be decided from the mount-point string,
+// never from which entry point was called.
+int download_area_index(const SceAppContentMountPoint* mountPoint) {
+    char text[kMountPointTextSize];
+    mount_point_text(mountPoint, text);
+
+    static constexpr char kPrefix[] = "/download";
+    constexpr size_t kPrefixLen = sizeof(kPrefix) - 1u;
+    if (std::strncmp(text, kPrefix, kPrefixLen) != 0) return -1;
+
+    const char* digits = text + kPrefixLen;
+    if (*digits == '\0') return -1;
+    int index = 0;
+    for (const char* p = digits; *p != '\0'; ++p) {
+        if (!std::isdigit(static_cast<unsigned char>(*p))) return -1;
+        if (index > 99) return 999;
+        index = index * 10 + (*p - '0');
+    }
+    return index;
+}
+
+// Ours only when the running firmware has no area 2 of its own. On 5.02+ every
+// area belongs to the real daemon and this whole path stays dormant.
+bool download_area_is_ours(const SceAppContentMountPoint* mountPoint) {
+    return !firmware_has_download2() && download_area_index(mountPoint) >= 2;
+}
+
+// A size_t out-param that the service must have written. Poisoned first so a
+// reply that returns SCE_OK without filling anything is caught here instead of
+// handing the title an uninitialised size -- the exact shape that has locked
+// this console before.
+int32_t app2_size_query(uint32_t command,
+                        const SceAppContentMountPoint* mountPoint,
+                        size_t* value,
+                        const char* what) {
+    static constexpr size_t kPoison = static_cast<size_t>(0xdeadbeefdeadbeefull);
+    size_t answer = kPoison;
+    const int32_t rc = app_rpc_mount_query(command, 0u, mountPoint, &answer, &app2_rpc_invoke);
+    if (rc != SCE_OK) {
+        dlc_logf("dlc.download2.%s branch=service rc=0x%08x (out-param left unwritten)",
+                 what,
+                 static_cast<unsigned>(rc));
+        return rc;
+    }
+    if (answer == kPoison) {
+        dlc_logf("dlc.download2.%s branch=service rc=SCE_OK but out-param UNWRITTEN"
+                 " -> NOT_SUPPORTED",
+                 what);
+        return SCE_APP_CONTENT_ERROR_NOT_SUPPORTED;
+    }
+    *value = answer;
+    dlc_logf("dlc.download2.%s branch=service rc=SCE_OK value=%llu",
+             what,
+             static_cast<unsigned long long>(answer));
+    return SCE_OK;
+}
+
+// Expand/Shrink take a size in MiB by value through a pointer-shaped ABI.
+int32_t download2_resize(uint32_t command, const char* what, const void* sizeMib) {
+    const unsigned long long size = static_cast<unsigned long long>(
+        reinterpret_cast<uintptr_t>(sizeMib));
+    if (firmware_has_download2()) {
+        dlc_logf("dlc.download2.%s enter sizeMib=%llu branch=firmware", what, size);
+        const int32_t rc = app_rpc_mount_handle_command(command, sizeMib);
+        dlc_logf("dlc.download2.%s branch=firmware rc=0x%08x", what, static_cast<unsigned>(rc));
+        return rc;
+    }
+#if SCE_DLC_EMU_DOWNLOAD2_PROBE_ONLY
+    dlc_logf("dlc.download2.%s enter sizeMib=%llu branch=probe-only -> NOT_SUPPORTED", what, size);
+    return SCE_APP_CONTENT_ERROR_NOT_SUPPORTED;
+#else
+    dlc_logf("dlc.download2.%s enter sizeMib=%llu branch=service", what, size);
+    const int32_t rc = app_rpc_mount_handle_command(command, sizeMib, &app2_rpc_invoke);
+    dlc_logf("dlc.download2.%s branch=service rc=0x%08x", what, static_cast<unsigned>(rc));
+    return rc;
+#endif
+}
+
+// Routing decision, logged once per call so the log always says which half
+// answered. Probe-only builds report every area-2 call as refused.
+bool route_download_area_to_service(const SceAppContentMountPoint* mountPoint, const char* what) {
+    char text[kMountPointTextSize];
+    mount_point_text(mountPoint, text);
+    const int area = download_area_index(mountPoint);
+    const bool ours = download_area_is_ours(mountPoint);
+#if SCE_DLC_EMU_DOWNLOAD2_PROBE_ONLY
+    dlc_logf("dlc.download2.%s enter mount=\"%s\" area=%d branch=%s",
+             what,
+             text,
+             area,
+             ours ? "probe-only(refuse)" : "firmware");
+    return false;
+#else
+    dlc_logf("dlc.download2.%s enter mount=\"%s\" area=%d branch=%s",
+             what,
+             text,
+             area,
+             ours ? "service" : "firmware");
+    return ours;
+#endif
+}
+
+// Work item 1: answer "can a sandboxed game reach a payload-hosted service under
+// a new name?" in one launch, before any routing depends on it. Runs from
+// Initialize so the answer is in the log even for a title that never gets as far
+// as asking for the area.
+void download2_service_probe() {
+    static std::atomic<uint32_t> probed{0};
+    uint32_t expected = 0;
+    if (!probed.compare_exchange_strong(expected, 1u, std::memory_order_acq_rel)) return;
+
+    const unsigned firmware = static_cast<unsigned>(system_sw_version() >> 16);
+    if (firmware_has_download2()) {
+        dlc_logf("dlc.download2.probe fw=0x%04x native-area2 -- service not needed", firmware);
+        return;
+    }
+
+    DlcLockGuard lock(g_app2Rpc.mutex);
+    const bool reachable = ensure_app2_rpc_unlocked();
+    dlc_logf("dlc.download2.probe fw=0x%04x service=\"SceAppContent2\" reachable=%s routing=%s",
+             firmware,
+             reachable ? "yes" : "no",
+             SCE_DLC_EMU_DOWNLOAD2_PROBE_ONLY ? "probe-only"
+                                              : (reachable ? "service" : "refuse"));
 }
 
 const char* package_type_name(uint32_t packageType) {
@@ -1172,11 +1377,11 @@ private:
     }
 };
 
-bool load_file(char* out, size_t outSize, size_t* outLen, bool* tooLarge) {
+bool load_file(const char* path, char* out, size_t outSize, size_t* outLen, bool* tooLarge) {
     if (!out || outSize == 0) return false;
     out[0] = '\0';
     if (tooLarge) *tooLarge = false;
-    int fd = ::sceKernelOpen(SCE_DLC_EMU_INI_PATH, SCE_KERNEL_O_RDONLY, 0);
+    int fd = ::sceKernelOpen(path, SCE_KERNEL_O_RDONLY, 0);
     if (fd < 0) {
         return false;
     }
@@ -1227,7 +1432,7 @@ DlcState& ensure_loaded() {
     static char ini[kIniBufferBytes]{};
     size_t len = 0;
     bool tooLarge = false;
-    if (!load_file(ini, sizeof(ini), &len, &tooLarge)) {
+    if (!load_file(SCE_DLC_EMU_INI_PATH, ini, sizeof(ini), &len, &tooLarge)) {
         if (tooLarge) {
             dlc_logf("dlc.load status=parse-failed reason=file-too-large path=%s maxBytes=%u",
                               SCE_DLC_EMU_INI_PATH,
@@ -1931,6 +2136,138 @@ int32_t consume_entry_unlocked(DlcState& st,
     return SCE_OK;
 }
 
+// userDefinedParam1..4 are declared in the title's own parameter file. The real
+// library forwards the request to the content service; reading the same file
+// answers it here, so a service that refuses the command cannot leave the
+// caller holding an uninitialised value.
+constexpr size_t kMaxParamJsonBytes = 1024u * 1024u;
+constexpr unsigned kUserDefinedParamCount = 4u;
+
+enum class AppParamSource { kFile, kUndeclared, kUnknown };
+
+struct AppParamCache {
+    DlcMutex mutex;
+    bool loaded{false};
+    bool fileRead{false};
+    bool present[kUserDefinedParamCount]{};
+    int32_t value[kUserDefinedParamCount]{};
+};
+
+AppParamCache& app_param_cache() {
+    static AppParamCache cache;
+    return cache;
+}
+
+// The parameter file grows with the number of localized titles, so the buffer
+// grows with it rather than being sized up front.
+char* read_whole_file(const char* path, size_t* outLen) {
+    const int fd = ::sceKernelOpen(path, SCE_KERNEL_O_RDONLY, 0);
+    if (fd < 0) return nullptr;
+    size_t capacity = 16u * 1024u;
+    size_t total = 0;
+    char* buffer = static_cast<char*>(std::malloc(capacity));
+    while (buffer) {
+        if (total + 1u >= capacity) {
+            if (capacity >= kMaxParamJsonBytes) break;
+            char* resized = static_cast<char*>(std::realloc(buffer, capacity * 2u));
+            if (!resized) {
+                std::free(buffer);
+                buffer = nullptr;
+                break;
+            }
+            buffer = resized;
+            capacity *= 2u;
+        }
+        const ssize_t rc = ::sceKernelRead(fd, buffer + total, capacity - total - 1u);
+        if (rc < 0) {
+            std::free(buffer);
+            buffer = nullptr;
+            break;
+        }
+        if (rc == 0) break;
+        total += static_cast<size_t>(rc);
+    }
+    (void)::sceKernelClose(fd);
+    if (!buffer) return nullptr;
+    buffer[total] = '\0';
+    if (outLen) *outLen = total;
+    return buffer;
+}
+
+// A hand parse rather than a JSON library: the file is machine generated and
+// only these four integer keys are ever read from it.
+bool find_json_int(const char* json, const char* key, int32_t* outValue) {
+    if (!json || !key || !outValue) return false;
+    const size_t keyLen = std::strlen(key);
+    for (const char* cursor = std::strstr(json, key); cursor;
+         cursor = std::strstr(cursor + 1, key)) {
+        if (cursor == json || cursor[-1] != '"') continue;
+        const char* after = cursor + keyLen;
+        if (*after != '"') continue;
+        ++after;
+        while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') ++after;
+        if (*after != ':') continue;
+        ++after;
+        while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') ++after;
+        char* end = nullptr;
+        const long parsed = std::strtol(after, &end, 10);
+        if (end == after) continue;
+        if (parsed < INT32_MIN || parsed > INT32_MAX) continue;
+        *outValue = static_cast<int32_t>(parsed);
+        return true;
+    }
+    return false;
+}
+
+void ensure_app_params_unlocked(AppParamCache& cache) {
+    if (cache.loaded) return;
+    cache.loaded = true;
+    size_t len = 0;
+    char* json = read_whole_file(SCE_DLC_EMU_PARAM_JSON_PATH, &len);
+    if (!json) {
+        dlc_logf("dlc.app_param.load status=missing path=%s", SCE_DLC_EMU_PARAM_JSON_PATH);
+        return;
+    }
+    cache.fileRead = true;
+    for (unsigned i = 0; i < kUserDefinedParamCount; ++i) {
+        char key[32]{};
+        (void)std::snprintf(key, sizeof(key), "userDefinedParam%u", i + 1u);
+        int32_t parsed = 0;
+        if (find_json_int(json, key, &parsed)) {
+            cache.present[i] = true;
+            cache.value[i] = parsed;
+        }
+    }
+    dlc_logf("dlc.app_param.load status=ok path=%s bytes=%u declared=%u%u%u%u p1=%d p2=%d p3=%d p4=%d",
+             SCE_DLC_EMU_PARAM_JSON_PATH,
+             static_cast<unsigned>(len),
+             cache.present[0] ? 1u : 0u,
+             cache.present[1] ? 1u : 0u,
+             cache.present[2] ? 1u : 0u,
+             cache.present[3] ? 1u : 0u,
+             cache.value[0], cache.value[1], cache.value[2], cache.value[3]);
+    std::free(json);
+}
+
+// kUnknown means the file could not be read at all, which is the only case that
+// still has to ask the service.
+AppParamSource user_defined_param(uint32_t paramId, int32_t* outValue) {
+    if (paramId < 1u || paramId > kUserDefinedParamCount) return AppParamSource::kUnknown;
+    AppParamCache& cache = app_param_cache();
+    DlcLockGuard lock(cache.mutex);
+    ensure_app_params_unlocked(cache);
+    if (!cache.fileRead) return AppParamSource::kUnknown;
+    const unsigned index = paramId - 1u;
+    if (cache.present[index]) {
+        *outValue = cache.value[index];
+        return AppParamSource::kFile;
+    }
+    // Publishing tools emit every parameter a title sets, so an absent key is a
+    // parameter left at zero rather than a value we failed to find.
+    *outValue = 0;
+    return AppParamSource::kUndeclared;
+}
+
 } // namespace
 
 extern "C" {
@@ -1953,7 +2290,11 @@ int32_t dlcEmu_sceAppContentInitialize(const SceAppContentInitParam* initParam,
         return SCE_APP_CONTENT_ERROR_PARAMETER;
     }
     std::memset(bootParam, 0, sizeof(*bootParam));
-    return app_rpc_initialize(initParam, bootParam);
+    const int32_t rc = app_rpc_initialize(initParam, bootParam);
+    // After the real initialize, so a probe failure can never be mistaken for
+    // one: this only reports whether appcontent_svc is reachable.
+    download2_service_probe();
+    return rc;
 }
 
 int32_t dlcEmu_sceAppContentAppParamGetInt(SceAppContentAppParamId paramId, int32_t* value) {
@@ -1962,10 +2303,28 @@ int32_t dlcEmu_sceAppContentAppParamGetInt(SceAppContentAppParamId paramId, int3
         *value = SCE_APP_CONTENT_APPPARAM_SKU_FLAG_FULL;
         return SCE_OK;
     }
-    return app_rpc_control_output(kAppContentRpcCommandAppParamGetInt,
-                                  static_cast<uint32_t>(paramId),
-                                  value,
-                                  sizeof(*value));
+    // Callers switch on the value without reading the return code, so the slot is
+    // written on every path; a refusal must never leave it holding stack junk.
+    *value = 0;
+    int32_t parsed = 0;
+    const AppParamSource source = user_defined_param(static_cast<uint32_t>(paramId), &parsed);
+    if (source != AppParamSource::kUnknown) {
+        *value = parsed;
+        dlc_logf("dlc.app_param.get id=%u value=%d source=%s",
+                 static_cast<unsigned>(paramId),
+                 *value,
+                 source == AppParamSource::kFile ? "param.json" : "undeclared");
+        return SCE_OK;
+    }
+    const int32_t rc = app_rpc_control_output(kAppContentRpcCommandAppParamGetInt,
+                                              static_cast<uint32_t>(paramId),
+                                              value,
+                                              sizeof(*value));
+    dlc_logf("dlc.app_param.get id=%u value=%d source=rpc rc=%#x",
+             static_cast<unsigned>(paramId),
+             *value,
+             static_cast<unsigned>(rc));
+    return rc;
 }
 
 // Old AppContent list API: expose only active entries assigned to addcont.
@@ -2201,15 +2560,13 @@ int32_t dlcEmu_sceAppContentCheckBundleLicenseOnDisc(
 int32_t dlcEmu_sceAppContentDownload2Shrink(const void* downloadHandle) {
     if (!downloadHandle) return SCE_APP_CONTENT_ERROR_PARAMETER;
     // A SIZE in MiB passed by value, despite the pointer-shaped ABI. Never deref.
-    if (!firmware_has_download2()) return SCE_APP_CONTENT_ERROR_NOT_SUPPORTED;
-    return app_rpc_mount_handle_command(kAppContentRpcCommandDownload2Shrink, downloadHandle);
+    return download2_resize(kAppContentRpcCommandDownload2Shrink, "shrink", downloadHandle);
 }
 
 int32_t dlcEmu_sceAppContentDownload2Expand(const void* downloadHandle) {
     if (!downloadHandle) return SCE_APP_CONTENT_ERROR_PARAMETER;
     // See Download2Shrink: a size in MiB, not a handle.
-    if (!firmware_has_download2()) return SCE_APP_CONTENT_ERROR_NOT_SUPPORTED;
-    return app_rpc_mount_handle_command(kAppContentRpcCommandDownload2Expand, downloadHandle);
+    return download2_resize(kAppContentRpcCommandDownload2Expand, "expand", downloadHandle);
 }
 
 int32_t dlcEmu_sceAppContentGetPlayableStatus(
@@ -2262,30 +2619,72 @@ int32_t dlcEmu_sceAppContentTemporaryDataGetAvailableSpaceKb(
 
 int32_t dlcEmu_sceAppContentDownloadDataFormat(const SceAppContentMountPoint* mountPoint) {
     if (!mountPoint) return SCE_APP_CONTENT_ERROR_PARAMETER;
-    return app_rpc_mount_operation(kAppContentRpcCommandDownloadDataFormat, mountPoint);
+    // fw 1.00 NID, shared with /download0. Only our own area is diverted; the
+    // service resolves the caller's title id to find the backing directory.
+    if (route_download_area_to_service(mountPoint, "format")) {
+        const int32_t rc = app_rpc_mount_operation(kAppContentRpcCommandDownloadDataFormat,
+                                                   mountPoint,
+                                                   &app2_rpc_invoke);
+        dlc_logf("dlc.download2.format branch=service rc=0x%08x", static_cast<unsigned>(rc));
+        return rc;
+    }
+    const int32_t rc = app_rpc_mount_operation(kAppContentRpcCommandDownloadDataFormat, mountPoint);
+    dlc_logf("dlc.download2.format branch=firmware rc=0x%08x", static_cast<unsigned>(rc));
+    return rc;
 }
 
 int32_t dlcEmu_sceAppContentDownloadDataGetAvailableSpaceKb(
     const SceAppContentMountPoint* mountPoint,
     size_t* availableSpaceKb) {
     if (!mountPoint || !availableSpaceKb) return SCE_APP_CONTENT_ERROR_PARAMETER;
-    return app_rpc_mount_query(kAppContentRpcCommandDataGetAvailableSpaceKb,
-                               0u,
+    // fw 1.00 NID: /download0 and /download1 must keep reaching the real daemon,
+    // which the title relies on for xpak_cache and its dcache files.
+    if (route_download_area_to_service(mountPoint, "spacekb")) {
+        return app2_size_query(kAppContentRpcCommandDataGetAvailableSpaceKb,
                                mountPoint,
-                               availableSpaceKb);
+                               availableSpaceKb,
+                               "spacekb");
+    }
+    const int32_t rc = app_rpc_mount_query(kAppContentRpcCommandDataGetAvailableSpaceKb,
+                                           0u,
+                                           mountPoint,
+                                           availableSpaceKb);
+    dlc_logf("dlc.download2.spacekb branch=firmware rc=0x%08x value=%llu",
+             static_cast<unsigned>(rc),
+             rc == SCE_OK ? static_cast<unsigned long long>(*availableSpaceKb) : 0ull);
+    return rc;
 }
 
 int32_t dlcEmu_sceAppContentDownloadDataGetBlockSize(
     const SceAppContentMountPoint* mountPoint,
     size_t* blockSize) {
     if (!mountPoint || !blockSize) return SCE_APP_CONTENT_ERROR_PARAMETER;
-    // Also fw 5.02. *blockSize deliberately left unwritten: a negative Sce error
-    // means out-params are not read, which is the firmware's own contract.
-    if (!firmware_has_download2()) return SCE_APP_CONTENT_ERROR_NOT_SUPPORTED;
-    return app_rpc_mount_query(kAppContentRpcCommandDownloadDataGetBlockSize,
-                               0u,
-                               mountPoint,
-                               blockSize);
+    const bool useService = route_download_area_to_service(mountPoint, "blocksize");
+    if (firmware_has_download2()) {
+        const int32_t rc = app_rpc_mount_query(kAppContentRpcCommandDownloadDataGetBlockSize,
+                                               0u,
+                                               mountPoint,
+                                               blockSize);
+        dlc_logf("dlc.download2.blocksize branch=firmware rc=0x%08x value=%llu",
+                 static_cast<unsigned>(rc),
+                 rc == SCE_OK ? static_cast<unsigned long long>(*blockSize) : 0ull);
+        return rc;
+    }
+    // Unlike the two above, 0x20010 is a fw 5.02 command with no handler in the
+    // 4.03 daemon for ANY area, so the real daemon is never an option here --
+    // forwarding wedges the thread until the watchdog reboots. Areas 0/1 are
+    // refused locally rather than round-tripped. *blockSize is deliberately left
+    // unwritten on refusal: a negative Sce error means out-params are not read,
+    // which is the firmware's own contract.
+    if (!useService) {
+        dlc_logf("dlc.download2.blocksize branch=refuse rc=0x%08x",
+                 static_cast<unsigned>(SCE_APP_CONTENT_ERROR_NOT_SUPPORTED));
+        return SCE_APP_CONTENT_ERROR_NOT_SUPPORTED;
+    }
+    return app2_size_query(kAppContentRpcCommandDownloadDataGetBlockSize,
+                           mountPoint,
+                           blockSize,
+                           "blocksize");
 }
 
 int32_t dlcEmu_sceAppContentDownload0Shrink(const SceAppContentMountPoint* mountPoint) {
