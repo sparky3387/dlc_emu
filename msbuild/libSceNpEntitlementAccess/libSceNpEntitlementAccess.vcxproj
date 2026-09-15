@@ -8,7 +8,7 @@
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{EF78D33E-EEB2-46D1-A2F7-05047BC259B7}</ProjectGuid>
-    <ProsperoSdkVersion>2.000</ProsperoSdkVersion>
+    <ProsperoSdkVersion>4.00</ProsperoSdkVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Prospero'" Label="Configuration">

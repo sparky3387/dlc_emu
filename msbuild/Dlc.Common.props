@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
-    <ExpectedProsperoSdkDir>C:\SCE\Prospero SDKs\2.000</ExpectedProsperoSdkDir>
+    <ExpectedProsperoSdkDir>C:\Program Files (x86)\SCE\Prospero SDKs\4.00</ExpectedProsperoSdkDir>
     <DlcProsperoSdkDir>$(ExpectedProsperoSdkDir)</DlcProsperoSdkDir>
     <DlcExtraPreprocessorDefinitions Condition="'$(DlcExtraPreprocessorDefinitions)'==''"></DlcExtraPreprocessorDefinitions>
     <DlcOutDir>$(SolutionDir)out\$(Platform)_$(Configuration)\</DlcOutDir>
