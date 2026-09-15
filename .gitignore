@@ -1,0 +1,15 @@
+# Build output
+out/
+
+# Visual Studio local state
+.vs/
+*.user
+*.suo
+
+# Local machine settings: SDK version/path differ per install, so keep them
+# OUT of tracked project files. See build_both.cmd.
+msbuild/Dlc.Local.props
+
+# ps5-payload-sdk build tooling
+__pycache__/
+*.pyc

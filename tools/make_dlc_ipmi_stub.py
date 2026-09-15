@@ -43,11 +43,19 @@ STUBS = {
     # libkernel_stub_weak.a (it is absent from the public headers too), but
     # libkernel.sprx exports it on every firmware from 1.00 onward, so only the
     # link stub is missing. ps5-payload-sdk declares it the same way.
+    #
+    # sceKernelDebugOutText is missing from that archive for the same reason.
+    # Without a stub the weak declaration in dlc_log.cpp resolves to NULL, so
+    # the `if (sceKernelDebugOutText)` guard is never taken and the klog sink is
+    # dead code in every build -- which is exactly how a "log build" ends up
+    # producing no klog output at all. The stub is weak, so a firmware that does
+    # not export it still loads and the guard still catches the NULL.
     "kernel": {
         "soname": "libkernel.prx",
         "module": "libkernel",
         "library": "libkernel",
         "symbols": [
+            ("sceKernelDebugOutText", STT_FUNC),
             ("sceKernelGetProsperoSystemSwVersion", STT_FUNC),
         ],
     },
