@@ -1,0 +1,144 @@
+name: PS5 Build and Release
+
+# Builds the three DLC/entitlement modules for the PS5 payload SDK, both
+# logging variants, and publishes ONE zip per tag.
+#
+# The zip layout is the contract with anything that consumes a release: the
+# members are nolog/<module>.sprx and log/<module>.sprx, which is what the
+# Windows solution's two configurations produce and what build.sh reproduces.
+# A consumer selects its variant by member name, so both must be in the one
+# asset.
+#
+# ONE ASSET PER RELEASE, deliberately. A release with several assets has to be
+# searched by name, and a consumer that takes the first one caches whatever
+# the API happened to list first.
+
+on:
+  push:
+    paths-ignore:
+      - "**/*.md"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    outputs:
+      archive_name: ${{ steps.package.outputs.archive_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout pacbrew-repo
+        uses: actions/checkout@v4
+        with:
+          repository: ps5-payload-dev/pacbrew-repo
+          path: pacbrew-repo
+
+      - name: Set up build environment
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            autoconf \
+            automake \
+            build-essential \
+            clang-18 \
+            cmake \
+            curl \
+            git \
+            libarchive-tools \
+            libtool \
+            lld-18 \
+            makepkg \
+            meson \
+            pacman-package-manager \
+            pkg-config \
+            python3 \
+            zip
+
+      - name: Build PS5 payload SDK
+        working-directory: pacbrew-repo/sdk
+        run: |
+          makepkg -c -f
+          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
+      # NEEDED: the modules are C++17 and include <atomic>, <cstdint>,
+      # <cstdio>. The SCE headers they also use are vendored in
+      # ps5/include/sce and come in with -idirafter, so nothing here depends
+      # on the official SDK.
+      - name: Build PS5 libc++ headers
+        working-directory: pacbrew-repo/libcxx
+        run: |
+          makepkg -c -f
+          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
+      # build.sh runs `make verify` per variant, so a module that links but
+      # does not carry the exports and imports it is supposed to fails here
+      # rather than on a console.
+      - name: Build and verify both variants
+        run: ./build.sh
+        env:
+          PS5_PAYLOAD_SDK: /opt/ps5-payload-sdk
+
+      - name: Create release archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_tag="$(git describe --abbrev=6 --dirty --always --tags 2>/dev/null || echo "${GITHUB_SHA::7}")"
+          archive_name="dlc_emu_${version_tag}.zip"
+
+          staging="$(mktemp -d)"
+          for variant in nolog log; do
+            mkdir -p "${staging}/${variant}"
+            for module in libSceAppContent libSceGameUpdate libSceNpEntitlementAccess; do
+              src="out/payload-sdk/${variant}/${module}.sprx"
+              if [ ! -f "${src}" ]; then
+                echo "missing build output: ${src}" >&2
+                exit 1
+              fi
+              cp "${src}" "${staging}/${variant}/${module}.sprx"
+            done
+          done
+          cp dlc_emu.example.ini "${staging}/"
+
+          ( cd "${staging}" && zip -9 -r "${GITHUB_WORKSPACE}/${archive_name}" . )
+          echo "archive_name=${archive_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive_name }}
+          path: ${{ steps.package.outputs.archive_name }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.archive_name }}
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/${{ needs.build.outputs.archive_name }}

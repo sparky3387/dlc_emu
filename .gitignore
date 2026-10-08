@@ -13,3 +13,6 @@ msbuild/Dlc.Local.props
 # ps5-payload-sdk build tooling
 __pycache__/
 *.pyc
+
+# Agent settings: per-checkout, and settings.local.json can hold local paths
+.claude/
