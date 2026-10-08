@@ -25,19 +25,30 @@ constexpr int kLogMode = 0666;
 constexpr int kLogFlags =
     SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_APPEND;
 
-// The configured path is tried first so a build-time override always wins, but
-// it cannot be the only candidate: /app0 is the game image and is mounted
-// READ-ONLY, so opening a log there fails and takes every line with it --
-// silently, because a logger has nowhere to report its own failure. The rest
-// are the writable mounts a sandboxed game actually has. /download2 is first
-// among them because ShadowMountPlus backs it with a directory on /data, which
-// makes the log readable over FTP without entering the sandbox.
+// The configured path is tried first so a build-time override always wins. It
+// defaults to /app0, which is where this log wants to be: the game's own deploy
+// directory, writable from inside the sandbox and readable over FTP afterwards
+// with no collector involved.
+//
+// THE CLAIM THIS COMMENT USED TO MAKE WAS WRONG. It said /app0 "is the game
+// image and is mounted READ-ONLY, so opening a log there fails". ShadowMountPlus
+// mount_read_only applies to the IMAGE mounts it manages, not to the game's
+// /app0 sandbox, and a later run measured the open succeeding every time.
+// USER: "app0 is not read only."
+//
+// The remaining entries survive only as fallbacks for a build that overrides
+// the path onto a mount that is not present. /download2 leads them because
+// ShadowMountPlus backs it with a directory on /data.
+//
+// /temp0 IS DELIBERATELY NOT A CANDIDATE. It is deleted as the process exits
+// and is unreadable in place over FTP (RETR 550, a uid refusal), so anything
+// landing there needed an outside collector to rescue it -- and the cases most
+// worth logging, a wedge or a hard power-off, never reach that collection.
 const char* const kLogPaths[] = {
     SCE_DLC_EMU_LOG_PATH,
     "/download2/dlc_emu.log",
     "/download1/dlc_emu.log",
     "/download0/dlc_emu.log",
-    "/temp0/dlc_emu.log",
 };
 
 std::atomic<const char*> g_logPath{nullptr};
@@ -129,6 +140,11 @@ void dlc_logf(const char* fmt, ...) {
         return;
     }
     (void)sceKernelWrite(fd, line, used);
+    // FSYNCED, because the runs this log exists for end in a hard power off and
+    // the last line is the deliverable. close() returns the fd, it does not
+    // promise the bytes reached the medium; a tail still sitting in the cache
+    // when the power goes is indistinguishable from a call that never happened.
+    (void)sceKernelFsync(fd);
     (void)sceKernelClose(fd);
 }
 
