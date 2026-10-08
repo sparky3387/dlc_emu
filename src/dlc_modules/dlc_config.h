@@ -39,10 +39,3 @@
 #define SCE_DLC_EMU_MOUNT_PREFIX "/app0/addcont"
 #endif
 
-// Build the reachability probe for the appcontent_svc payload but keep every
-// download-area-2 call on its old refusal. Answers "can a sandboxed game reach a
-// payload-hosted service under a new name?" in one launch without any build
-// being able to tell a title that Expand succeeded.
-#ifndef SCE_DLC_EMU_DOWNLOAD2_PROBE_ONLY
-#define SCE_DLC_EMU_DOWNLOAD2_PROBE_ONLY 0
-#endif
